@@ -69,10 +69,23 @@ def sgemm_coalesced(A, B, C, M, N, K):
 
     With a 1D block of 1024 threads, threadIdx.x runs 0..1023.
     Derive (row_in_tile, col_in_tile) from threadIdx.x using integer division
-    and modulo by BLOCKSIZE. 
+    and modulo by BLOCKSIZE.
     Be careful which one indexes the column.
     """
-    # TODO
+    tid = cuda.threadIdx.x
+
+    row_in_tile = tid // BLOCKSIZE
+    col_in_tile = tid % BLOCKSIZE
+
+    row = cuda.blockIdx.x * BLOCKSIZE + row_in_tile
+    col = cuda.blockIdx.y * BLOCKSIZE + col_in_tile
+
+    tmp = float32(0.0)
+
+    if row < M and col < N:
+        for i in range(K):
+            tmp += A[row, i] * B[i, col]
+        C[row, col] = tmp
     return
 
 
@@ -97,8 +110,48 @@ def sgemm_smem(A, B, C, M, N, K):
     (BK3, BN3) for Bs.
     Use 0.0 in the SMEM load when the global index is out of bounds.
     """
-    # TODO
-    return
+
+    As = cuda.shared.array((BM3, BK3), float32)
+    Bs = cuda.shared.array((BK3, BN3), float32)
+
+    tx = cuda.threadIdx.x
+
+    row = cuda.blockIdx.x * BM3 + tx // BN3
+    col = cuda.blockIdx.y * BN3 + tx % BN3
+
+    tmp = float32(0.0)
+
+    for t in range((K + BK3 - 1) // BK3):
+
+        a_row = tx // BK3
+        a_col = tx % BK3
+        global_a_row = cuda.blockIdx.x * BM3 + a_row
+        global_k = t * BK3 + a_col
+
+        if global_a_row < M and global_k < K:
+            As[a_row, a_col] = A[global_a_row, global_k]
+        else:
+            As[a_row, a_col] = float32(0.0)
+
+        b_row = tx // BN3
+        b_col = tx % BN3
+        global_b_row = t * BK3 + b_row
+        global_b_col = cuda.blockIdx.y * BN3 + b_col
+
+        if global_b_row < K and global_b_col < N:
+            Bs[b_row, b_col] = B[global_b_row, global_b_col]
+        else:
+            Bs[b_row, b_col] = float32(0.0)
+
+        cuda.syncthreads()
+
+        for i in range(BK3):
+            tmp += As[tx // BN3, i] * Bs[i, tx % BN3]
+
+        cuda.syncthreads()
+
+    if row < M and col < N:
+        C[row, col] = tmp
 
 
 # ── K4: 1D register tiling (TODO) ───────────────────────────────────
@@ -123,7 +176,70 @@ def sgemm_1d_tile(A, B, C, M, N, K):
     Use cuda.local.array(TM4, float32) for the per-thread accumulator array.
     Initialize all entries to 0.0 before the K-loop.
     """
-    # TODO
+    As = cuda.shared.array((BM4, BK4), float32)
+    Bs = cuda.shared.array((BK4, BN4), float32)
+
+    tx = cuda.threadIdx.x   # 0..511
+
+    # blockIdx.x → 列方向，blockIdx.y → 行方向
+    # 每个线程负责 TM4 行、1 列
+    thread_row = tx // BN4          # tile 内"哪一列组" → 负责的行起点偏移 [0, BM4/TM4)
+    thread_col = tx % BN4           # tile 内列 [0, BN4)
+
+    # 该 block 负责的输出全局起始坐标
+    block_row_start = cuda.blockIdx.y * BM4   # 注意 y → 行
+    block_col_start = cuda.blockIdx.x * BN4   # 注意 x → 列
+
+    # 全局列（该线程只负责一列）
+    global_col = block_col_start + thread_col
+
+    # 累加器：TM4 个输出行
+    acc = cuda.local.array(TM4, float32)
+    for i in range(TM4):
+        acc[i] = float32(0.0)
+
+    for t in range((K + BK4 - 1) // BK4):
+
+        # 加载 A tile (BM4 x BK4)，
+        # tx: 0..511，A tile 有 64*8=512 个元素
+        a_row = tx // BK4                          # [0, BM4)
+        a_col = tx % BK4                           # [0, BK4)
+        global_a_row = block_row_start + a_row
+        global_a_col = t * BK4 + a_col
+
+        if global_a_row < M and global_a_col < K:
+            As[a_row, a_col] = A[global_a_row, global_a_col]
+        else:
+            As[a_row, a_col] = float32(0.0)
+
+        # 加载 B tile (BK4 x BN4)
+        b_row = tx // BN4                          # [0, BK4)
+        b_col = tx % BN4                           # [0, BN4)
+        global_b_row = t * BK4 + b_row
+        global_b_col = block_col_start + b_col
+
+        if global_b_row < K and global_b_col < N:
+            Bs[b_row, b_col] = B[global_b_row, global_b_col]
+        else:
+            Bs[b_row, b_col] = float32(0.0)
+
+        cuda.syncthreads()
+
+        # 计算：该线程负责 TM4 行，dot 进各自 acc
+        for k in range(BK4):
+            b_val = Bs[k, thread_col]
+            for m in range(TM4):
+                
+                As_row = thread_row * TM4 + m # 该线程负责的第 m 行在 tile 内的行号
+                acc[m] += As[As_row, k] * b_val
+
+        cuda.syncthreads()
+
+    # 写回 
+    for m in range(TM4):
+        global_row = block_row_start + thread_row * TM4 + m
+        if global_row < M and global_col < N:
+            C[global_row, global_col] = acc[m]
     return
 
 
@@ -148,7 +264,85 @@ def sgemm_2d_tile(A, B, C, M, N, K):
     For accumulators, use cuda.local.array((TM5, TN5), float32).
     Numba supports tuple-shaped local arrays!
     """
-    # TODO
+    As = cuda.shared.array((BM5, BK5), float32)
+    Bs = cuda.shared.array((BK5, BN5), float32)
+
+    tx = cuda.threadIdx.x   # 0..255
+
+    # 每线程负责 TM5 行 × TN5 列的输出子块
+    # 每 block 在列方向有 BN5/TN5=16 个线程，行方向有 BM5/TM5=16 个线程
+    thread_row = tx // (BN5 // TN5)    # [0, 16)
+    thread_col = tx % (BN5 // TN5)     # [0, 16)
+
+    block_row_start = cuda.blockIdx.y * BM5
+    block_col_start = cuda.blockIdx.x * BN5
+
+    # 累加器：TM5 × TN5
+    acc = cuda.local.array((TM5, TN5), float32)
+    for m in range(TM5):
+        for n in range(TN5):
+            acc[m, n] = float32(0.0)
+
+    # 加载 A 时的行步长：256 threads，BM5*BK5=1024 元素，每线程加载 4 个
+    # 让连续线程访问连续列（coalesced）：
+    #   thread tx 负责 A[tx // BK5, tx % BK5], [tx // BK5 + stride, ...], ...
+    A_load_stride = (BM5 * BK5) // (cuda.blockDim.x)   # = 4 rows per thread?
+    # 更清晰的写法：把 1024 个元素铺开，每线程按 blockDim.x 步长跳
+    num_threads = cuda.blockDim.x   # 256
+
+    for t in range((K + BK5 - 1) // BK5):
+
+        # 加载 A tile (BM5 x BK5 = 1024 元素)，每线程加载 4 个
+        for load_idx in range((BM5 * BK5) // num_threads):
+            elem_idx = load_idx * num_threads + tx
+            a_row = elem_idx // BK5
+            a_col = elem_idx % BK5
+            global_a_row = block_row_start + a_row
+            global_a_col = t * BK5 + a_col
+            if global_a_row < M and global_a_col < K:
+                As[a_row, a_col] = A[global_a_row, global_a_col]
+            else:
+                As[a_row, a_col] = float32(0.0)
+
+        # 加载 B tile (BK5 x BN5 = 1024 元素)，每线程加载 4 个
+        for load_idx in range((BK5 * BN5) // num_threads):
+            elem_idx = load_idx * num_threads + tx
+            b_row = elem_idx // BN5
+            b_col = elem_idx % BN5
+            global_b_row = t * BK5 + b_row
+            global_b_col = block_col_start + b_col
+            if global_b_row < K and global_b_col < N:
+                Bs[b_row, b_col] = B[global_b_row, global_b_col]
+            else:
+                Bs[b_row, b_col] = float32(0.0)
+
+        cuda.syncthreads()
+
+        # 计算 TM5 × TN5 外积累加
+        for k in range(BK5):
+            # 缓存进寄存器
+            a_reg = cuda.local.array(TM5, float32)
+            b_reg = cuda.local.array(TN5, float32)
+
+            for m in range(TM5):
+                a_reg[m] = As[thread_row * TM5 + m, k]
+            for n in range(TN5):
+                b_reg[n] = Bs[k, thread_col * TN5 + n]
+
+            # 外积更新
+            for m in range(TM5):
+                for n in range(TN5):
+                    acc[m, n] += a_reg[m] * b_reg[n]
+
+        cuda.syncthreads()
+
+    # 写回
+    for m in range(TM5):
+        for n in range(TN5):
+            global_row = block_row_start + thread_row * TM5 + m
+            global_col = block_col_start + thread_col * TN5 + n
+            if global_row < M and global_col < N:
+                C[global_row, global_col] = acc[m, n]
     return
 
 
